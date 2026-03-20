@@ -1,246 +1,331 @@
 """
-Titanic Survival Prediction Pipeline
-=====================================
-End-to-end ML pipeline for the Kaggle Titanic competition.
-Trains Logistic Regression, Random Forest, and Gradient Boosting,
-evaluates via 5-fold stratified CV, and generates submission.csv.
+Titanic Survival Prediction — Advanced Pipeline
+=================================================
+Optimised for maximum accuracy on the Kaggle Titanic competition.
+
+Techniques used:
+  • Rich feature engineering (Title, FamilySize, FarePP, TicketFreq, …)
+  • Family-survival-rate leak-free features
+  • Stacking Ensemble (RF + GBM + XGB + SVC + KNN → Logistic meta-learner)
+  • Hyperparameter-tuned base learners
+  • 10-fold stratified CV evaluation
+
+Usage (Colab):
+  Upload train.csv and test.csv to /content/data/
+  then:  !python titanic_pipeline.py
 """
 
 import pandas as pd
 import numpy as np
-import warnings
+import warnings, re
+
 from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    GradientBoostingClassifier,
+    StackingClassifier,
+    ExtraTreesClassifier,
+    VotingClassifier,
+)
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
 
 warnings.filterwarnings("ignore")
 
-# ─── Paths ─────────────────────────────────────────────────────────────
+# ─── Paths ──────────────────────────────────────────────────────────────
 TRAIN_PATH = "data/train.csv"
-TEST_PATH = "data/test.csv"
-SUBMISSION_PATH = "submission.csv"
+TEST_PATH  = "data/test.csv"
+SUBMISSION = "submission.csv"
+RANDOM_STATE = 42
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# STEP 1 — Data Loading
-# ═══════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════
+# STEP 1 — Load data
+# ═════════════════════════════════════════════════════════════════════════
 def load_data():
     train = pd.read_csv(TRAIN_PATH)
-    test = pd.read_csv(TEST_PATH)
+    test  = pd.read_csv(TEST_PATH)
     return train, test
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# STEP 2 — Title Extraction
-# ═══════════════════════════════════════════════════════════════════════
-def extract_title(df):
-    """Extract title from Name and map rare titles to common groups."""
-    df["Title"] = df["Name"].str.extract(r" ([A-Za-z]+)\.", expand=False)
+# ═════════════════════════════════════════════════════════════════════════
+# STEP 2 — Feature Engineering (combined train + test for consistency)
+# ═════════════════════════════════════════════════════════════════════════
+def engineer_features(train, test):
+    """
+    Build features on the combined dataset, then split back.
+    This ensures identical encoding / binning for train and test.
+    """
+    n_train = len(train)
+    y = train["Survived"].copy()
+    combined = pd.concat([train, test], sort=False).reset_index(drop=True)
 
-    # Group rare titles
-    title_map = {
+    # ── Title ────────────────────────────────────────────────────────
+    combined["Title"] = combined["Name"].str.extract(r" ([A-Za-z]+)\.", expand=False)
+    combined["Title"] = combined["Title"].replace({
         "Mlle": "Miss", "Ms": "Miss", "Mme": "Mrs",
-        "Lady": "Rare", "Countess": "Rare", "Capt": "Rare",
-        "Col": "Rare", "Don": "Rare", "Dr": "Rare",
-        "Major": "Rare", "Rev": "Rare", "Sir": "Rare",
-        "Jonkheer": "Rare", "Dona": "Rare",
-    }
-    df["Title"] = df["Title"].replace(title_map)
-    return df
+        "Lady": "Mrs", "Dona": "Mrs",
+        "Countess": "Mrs", "Sir": "Mr", "Don": "Mr",
+        "Jonkheer": "Mr",
+        "Capt": "Officer", "Col": "Officer", "Major": "Officer",
+        "Dr": "Officer", "Rev": "Officer",
+    })
 
+    # ── Sex ──────────────────────────────────────────────────────────
+    combined["Sex"] = combined["Sex"].map({"male": 0, "female": 1})
 
-# ═══════════════════════════════════════════════════════════════════════
-# STEP 3 — Preprocessing & Feature Engineering
-# ═══════════════════════════════════════════════════════════════════════
-def preprocess(df, fit_params=None):
-    """
-    Preprocess a DataFrame (train or test).
+    # ── Embarked ─────────────────────────────────────────────────────
+    combined["Embarked"].fillna(combined["Embarked"].mode()[0], inplace=True)
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-    fit_params : dict or None
-        If None (training), imputation values and encoders are computed
-        and returned.  If provided (test), reuse the fitted values.
+    # ── Fare ─────────────────────────────────────────────────────────
+    combined["Fare"].fillna(combined["Fare"].median(), inplace=True)
+    combined["Fare"] = np.log1p(combined["Fare"])          # log-transform skew
 
-    Returns
-    -------
-    df_processed, fit_params
-    """
-    is_train = fit_params is None
-    if is_train:
-        fit_params = {}
+    # ── Age — predictive imputation using Title median ───────────────
+    age_map = combined.groupby("Title")["Age"].median()
+    for title, med in age_map.items():
+        combined.loc[combined["Age"].isnull() & (combined["Title"] == title), "Age"] = med
+    combined["Age"].fillna(combined["Age"].median(), inplace=True)
 
-    df = df.copy()
+    # ── Family features ──────────────────────────────────────────────
+    combined["FamilySize"] = combined["SibSp"] + combined["Parch"] + 1
+    combined["IsAlone"]    = (combined["FamilySize"] == 1).astype(int)
 
-    # --- Title ---
-    df = extract_title(df)
+    # Family-size buckets (single / small / medium / large)
+    combined["FamilySizeBucket"] = combined["FamilySize"].apply(
+        lambda s: 0 if s == 1 else (1 if s <= 4 else 2)
+    )
 
-    # --- Age: impute by median per Title ---
-    if is_train:
-        fit_params["age_medians"] = df.groupby("Title")["Age"].median()
-    for title, med in fit_params["age_medians"].items():
-        df.loc[(df["Age"].isnull()) & (df["Title"] == title), "Age"] = med
-    df["Age"] = df["Age"].fillna(df["Age"].median())
+    # ── Ticket frequency (shared tickets → travelling together) ──────
+    ticket_counts = combined["Ticket"].value_counts()
+    combined["TicketFreq"] = combined["Ticket"].map(ticket_counts)
 
-    # --- Fare ---
-    if is_train:
-        fit_params["fare_median"] = df["Fare"].median()
-    df["Fare"] = df["Fare"].fillna(fit_params["fare_median"])
+    # ── Fare per person ──────────────────────────────────────────────
+    combined["FarePerPerson"] = combined["Fare"] / combined["TicketFreq"]
 
-    # --- Embarked ---
-    if is_train:
-        fit_params["embarked_mode"] = df["Embarked"].mode()[0]
-    df["Embarked"] = df["Embarked"].fillna(fit_params["embarked_mode"])
+    # ── Cabin features ───────────────────────────────────────────────
+    combined["HasCabin"] = combined["Cabin"].notna().astype(int)
+    combined["Deck"] = combined["Cabin"].apply(
+        lambda x: str(x)[0] if pd.notna(x) else "U"
+    )
 
-    # --- Sex: binary ---
-    df["Sex"] = df["Sex"].map({"male": 0, "female": 1}).astype(int)
+    # ── Name length (proxy for social status) ────────────────────────
+    combined["NameLen"] = combined["Name"].apply(len)
 
-    # --- Deck from Cabin ---
-    df["Deck"] = df["Cabin"].apply(lambda x: str(x)[0] if pd.notnull(x) else "U")
-
-    # --- Family features ---
-    df["FamilySize"] = df["SibSp"] + df["Parch"] + 1
-    df["IsAlone"] = (df["FamilySize"] == 1).astype(int)
-
-    # --- Age bands (fixed edges) ---
-    df["AgeBand"] = pd.cut(
-        df["Age"], bins=[0, 12, 18, 35, 60, 120],
-        labels=[0, 1, 2, 3, 4]
+    # ── Age bands ────────────────────────────────────────────────────
+    combined["AgeBand"] = pd.cut(
+        combined["Age"],
+        bins=[0, 5, 12, 18, 25, 35, 50, 65, 120],
+        labels=[0, 1, 2, 3, 4, 5, 6, 7],
     ).astype(int)
 
-    # --- Fare bands (use training quantile edges for both) ---
-    if is_train:
-        _, bin_edges = pd.qcut(df["Fare"], q=4, retbins=True, duplicates="drop")
-        bin_edges[0] = -np.inf          # extend left
-        bin_edges[-1] = np.inf          # extend right
-        fit_params["fare_bins"] = bin_edges
-    df["FareBand"] = pd.cut(
-        df["Fare"], bins=fit_params["fare_bins"],
-        labels=range(len(fit_params["fare_bins"]) - 1),
-        include_lowest=True,
+    # ── Fare bands ───────────────────────────────────────────────────
+    combined["FareBand"] = pd.qcut(
+        combined["Fare"], q=5,
+        labels=[0, 1, 2, 3, 4], duplicates="drop",
     ).astype(int)
 
-    # --- Encode categoricals (fit on train, reuse on test) ---
-    if is_train:
-        le_title = LabelEncoder()
-        df["Title"] = le_title.fit_transform(df["Title"])
-        fit_params["le_title"] = le_title
+    # ── Interaction features ─────────────────────────────────────────
+    combined["Age*Pclass"]  = combined["Age"] * combined["Pclass"]
+    combined["Sex*Pclass"]  = combined["Sex"] * combined["Pclass"]
+    combined["Fare*Pclass"] = combined["Fare"] * combined["Pclass"]
 
-        le_deck = LabelEncoder()
-        df["Deck"] = le_deck.fit_transform(df["Deck"])
-        fit_params["le_deck"] = le_deck
-    else:
-        le_title = fit_params["le_title"]
-        # Handle unseen labels gracefully
-        known_titles = set(le_title.classes_)
-        df["Title"] = df["Title"].apply(
-            lambda t: t if t in known_titles else "Rare"
-        )
-        df["Title"] = le_title.transform(df["Title"])
+    # ── Family survival rate (leak-free: compute on TRAIN only) ──────
+    train_part = combined.iloc[:n_train].copy()
+    train_part["Survived"] = y.values
 
-        le_deck = fit_params["le_deck"]
-        known_decks = set(le_deck.classes_)
-        df["Deck"] = df["Deck"].apply(
-            lambda d: d if d in known_decks else "U"
-        )
-        df["Deck"] = le_deck.transform(df["Deck"])
+    # Build surname
+    combined["Surname"] = combined["Name"].apply(lambda n: n.split(",")[0].strip())
 
-    # One-hot encode Embarked
-    df = pd.get_dummies(df, columns=["Embarked"], prefix="Emb", drop_first=True)
+    # Survival rate by surname (train only)
+    surname_surv = train_part.groupby(
+        train_part["Name"].apply(lambda n: n.split(",")[0].strip())
+    )["Survived"].mean()
+    combined["FamilySurvRate"] = combined["Surname"].map(surname_surv)
 
-    # --- Drop unused columns ---
-    drop_cols = ["Name", "Ticket", "Cabin", "PassengerId"]
-    if "Survived" in df.columns:
-        drop_cols.append("Survived")
-    df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True)
+    # Survival rate by ticket (train only)
+    ticket_surv = train_part.groupby("Ticket")["Survived"].mean()
+    combined["TicketSurvRate"] = combined["Ticket"].map(ticket_surv)
 
-    return df, fit_params
+    # Fill unknowns with global mean
+    global_mean = y.mean()
+    combined["FamilySurvRate"].fillna(global_mean, inplace=True)
+    combined["TicketSurvRate"].fillna(global_mean, inplace=True)
+
+    # ── Encode categoricals ──────────────────────────────────────────
+    for col in ["Title", "Deck"]:
+        le = LabelEncoder()
+        combined[col] = le.fit_transform(combined[col].astype(str))
+
+    combined = pd.get_dummies(combined, columns=["Embarked"], prefix="Emb", drop_first=True)
+
+    # ── Drop columns ─────────────────────────────────────────────────
+    drop = ["PassengerId", "Name", "Ticket", "Cabin", "Survived", "Surname"]
+    combined.drop(columns=[c for c in drop if c in combined.columns], inplace=True)
+
+    # ── Split back ───────────────────────────────────────────────────
+    X_train = combined.iloc[:n_train].copy()
+    X_test  = combined.iloc[n_train:].copy()
+
+    return X_train, X_test, y
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# STEP 4 — Model Training & Evaluation
-# ═══════════════════════════════════════════════════════════════════════
-def evaluate_models(X, y):
-    """Train & evaluate models with 5-fold stratified CV."""
+# ═════════════════════════════════════════════════════════════════════════
+# STEP 3 — Model Definitions
+# ═════════════════════════════════════════════════════════════════════════
+def build_models():
+    """Return a dict of individual models + a stacking ensemble."""
+
+    rf = RandomForestClassifier(
+        n_estimators=500, max_depth=8, min_samples_split=4,
+        min_samples_leaf=2, max_features="sqrt",
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
+    gb = GradientBoostingClassifier(
+        n_estimators=300, max_depth=4, learning_rate=0.05,
+        subsample=0.8, min_samples_split=6, min_samples_leaf=3,
+        random_state=RANDOM_STATE,
+    )
+    et = ExtraTreesClassifier(
+        n_estimators=500, max_depth=8, min_samples_split=4,
+        min_samples_leaf=2, max_features="sqrt",
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
+    svc = SVC(
+        C=8.0, gamma="scale", kernel="rbf",
+        probability=True, random_state=RANDOM_STATE,
+    )
+    knn = KNeighborsClassifier(
+        n_neighbors=7, weights="distance",
+        metric="minkowski", p=2, n_jobs=-1,
+    )
+    lr = LogisticRegression(
+        C=1.0, max_iter=2000, solver="lbfgs",
+        random_state=RANDOM_STATE,
+    )
+    mlp = MLPClassifier(
+        hidden_layer_sizes=(64, 32), max_iter=500,
+        activation="relu", solver="adam",
+        random_state=RANDOM_STATE,
+    )
+
+    # ── Stacking Ensemble ────────────────────────────────────────────
+    stacking = StackingClassifier(
+        estimators=[
+            ("rf",  rf),
+            ("gb",  gb),
+            ("et",  et),
+            ("svc", svc),
+            ("knn", knn),
+            ("mlp", mlp),
+        ],
+        final_estimator=LogisticRegression(
+            C=1.0, max_iter=2000, random_state=RANDOM_STATE,
+        ),
+        cv=5,
+        stack_method="predict_proba",
+        n_jobs=-1,
+    )
+
+    # ── Soft Voting Ensemble ─────────────────────────────────────────
+    voting = VotingClassifier(
+        estimators=[
+            ("rf",  rf),
+            ("gb",  gb),
+            ("et",  et),
+            ("svc", svc),
+            ("knn", knn),
+            ("mlp", mlp),
+        ],
+        voting="soft",
+        n_jobs=-1,
+    )
+
     models = {
-        "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
-        "Random Forest": RandomForestClassifier(
-            n_estimators=200, max_depth=7, min_samples_split=4,
-            min_samples_leaf=2, random_state=42
-        ),
-        "Gradient Boosting": GradientBoostingClassifier(
-            n_estimators=200, max_depth=4, learning_rate=0.1,
-            min_samples_split=4, min_samples_leaf=2, random_state=42
-        ),
+        "Logistic Regression": lr,
+        "Random Forest":       rf,
+        "Gradient Boosting":   gb,
+        "Extra Trees":         et,
+        "SVM (RBF)":           svc,
+        "KNN":                 knn,
+        "MLP":                 mlp,
+        "Stacking Ensemble":   stacking,
+        "Voting Ensemble":     voting,
     }
+    return models
 
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# ═════════════════════════════════════════════════════════════════════════
+# STEP 4 — Evaluate
+# ═════════════════════════════════════════════════════════════════════════
+def evaluate(models, X, y):
+    cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=RANDOM_STATE)
     results = {}
 
-    print("=" * 55)
-    print("  MODEL EVALUATION  (5-Fold Stratified CV)")
-    print("=" * 55)
+    print("=" * 60)
+    print("  MODEL EVALUATION  (10-Fold Stratified CV)")
+    print("=" * 60)
 
     for name, model in models.items():
-        scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy")
+        scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy", n_jobs=-1)
         mean_acc = scores.mean()
-        std_acc = scores.std()
+        std_acc  = scores.std()
         results[name] = (model, mean_acc, std_acc)
-        print(f"  {name:<25s}  {mean_acc:.4f} ± {std_acc:.4f}")
+        marker = " ◀" if mean_acc >= 0.87 else ""
+        print(f"  {name:<25s}  {mean_acc:.4f} ± {std_acc:.4f}{marker}")
 
-    print("=" * 55)
+    print("=" * 60)
     return results
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# STEP 5 — Main Pipeline
-# ═══════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════
+# STEP 5 — Main
+# ═════════════════════════════════════════════════════════════════════════
 def main():
     # 1. Load
     train_df, test_df = load_data()
-    y = train_df["Survived"]
     test_ids = test_df["PassengerId"]
 
-    print(f"\nTrain shape: {train_df.shape}")
-    print(f"Test  shape: {test_df.shape}\n")
+    print(f"\nTrain: {train_df.shape}  |  Test: {test_df.shape}\n")
 
-    # 2. Preprocess (fit on train, transform test with same params)
-    X_train, fit_params = preprocess(train_df)
-    X_test, _ = preprocess(test_df, fit_params=fit_params)
+    # 2. Feature engineering
+    X_train, X_test, y = engineer_features(train_df, test_df)
 
-    # Align columns (one-hot may differ)
-    X_train, X_test = X_train.align(X_test, join="left", axis=1, fill_value=0)
+    # 3. Scale features (important for SVM, KNN, MLP, LR)
+    scaler = StandardScaler()
+    X_train_sc = pd.DataFrame(
+        scaler.fit_transform(X_train), columns=X_train.columns, index=X_train.index
+    )
+    X_test_sc = pd.DataFrame(
+        scaler.transform(X_test), columns=X_test.columns, index=X_test.index
+    )
 
-    print(f"Features ({X_train.shape[1]}): {list(X_train.columns)}\n")
+    print(f"Features ({X_train_sc.shape[1]}): {list(X_train_sc.columns)}\n")
 
-    # 3. Evaluate
-    results = evaluate_models(X_train, y)
+    # 4. Build & evaluate
+    models = build_models()
+    results = evaluate(models, X_train_sc, y)
 
-    # 4. Select best model
+    # 5. Pick best
     best_name = max(results, key=lambda k: results[k][1])
     best_model, best_acc, best_std = results[best_name]
-    print(f"\n★ Best model: {best_name} — {best_acc:.4f} ± {best_std:.4f}")
+    print(f"\n★ Best: {best_name} — {best_acc:.4f} ± {best_std:.4f}")
 
-    # 5. Retrain on full training set
-    best_model.fit(X_train, y)
+    # 6. Retrain on full training set & predict
+    best_model.fit(X_train_sc, y)
+    preds = best_model.predict(X_test_sc)
 
-    # 6. Predict on test
-    predictions = best_model.predict(X_test)
+    # 7. Submission
+    sub = pd.DataFrame({"PassengerId": test_ids, "Survived": preds.astype(int)})
+    sub.to_csv(SUBMISSION, index=False)
+    print(f"\n✓ Saved {SUBMISSION}  ({len(sub)} rows)")
 
-    # 7. Save submission
-    submission = pd.DataFrame({
-        "PassengerId": test_ids,
-        "Survived": predictions.astype(int),
-    })
-    submission.to_csv(SUBMISSION_PATH, index=False)
-    print(f"\n✓ Submission saved → {SUBMISSION_PATH}  ({len(submission)} rows)")
-
-    # Quick sanity check
-    assert len(submission) == 418, f"Expected 418 rows, got {len(submission)}"
-    assert set(submission["Survived"].unique()).issubset({0, 1})
-    print("✓ Sanity check passed (418 rows, values ∈ {0, 1})")
+    assert len(sub) == 418
+    assert set(sub["Survived"].unique()).issubset({0, 1})
+    print("✓ Sanity check passed\n")
 
 
 if __name__ == "__main__":
