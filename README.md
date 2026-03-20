@@ -14,8 +14,8 @@ Titanic-ML-Model/
 │   ├── test.csv               # 418 unlabelled passengers
 │   └── gender_submission.csv  # Sample submission format
 ├── titanic_pipeline.py        # End-to-end ML pipeline
+├── compare_submissions.py     # Script to analyze differences
 ├── requirements.txt           # Python dependencies
-├── submission.csv             # Generated predictions (gitignored)
 ├── LICENSE
 └── README.md
 ```
@@ -66,8 +66,27 @@ python titanic_pipeline.py
 
 This will:
 - Preprocess train & test data
-- Train and evaluate 3 models via 5-fold stratified CV
-- Select the best model and generate `submission.csv`
+- Train and evaluate 4 models via **10-fold stratified CV**
+- Generate `submission_vX.csv` with automated versioning
+
+---
+
+## 🔍 Data Understanding & Insights
+
+From our deep analysis of the competition dataset:
+
+### 📈 Survival Benchmarks
+- **Overall Survival Rate:** 38.4%
+- **The Gender Split:** Females (74.2%) vs Males (18.9%).
+- **Pclass Impact:** Pclass 1 (63%) vs Pclass 3 (24%).
+
+### 💡 Key Survival Signals
+| Segment | Survival Rate | Analysis |
+|---|---|---|
+| **HasCabin=1** | **66.7%** | Massive wealth/status proxy. Passengers with a known Cabin lived 2x as often. |
+| **IsBoy** | **57.5%** | Young males (Title: Master) survived at much higher rates than adult males. |
+| **FamilySize 2-4** | **55-72%** | The "Sweet Spot". Mid-sized families prioritized survival over solo travelers. |
+| **3rd Class Female**| **50.0%** | The "Coin Flip". The hardest segment for models due to high variance. |
 
 ---
 
@@ -76,11 +95,11 @@ This will:
 | Stage | Details |
 |---|---|
 | **Preprocessing** | Impute Age (median by Title), Fare (median), Embarked (mode) |
-| **Feature Engineering** | Title extraction, FamilySize, IsAlone, AgeBand, FareBand, Deck |
-| **Encoding** | Sex → binary, Embarked → one-hot, Title & Deck → label encoded |
-| **Models** | Logistic Regression, Random Forest, Gradient Boosting |
-| **Evaluation** | 5-fold Stratified Cross-Validation (accuracy) |
-| **Output** | `submission.csv` — `[PassengerId, Survived]` |
+| **Feature Engineering**| Title, FamilySizeBin, IsBoy, HasCabin, Age_Pclass, FarePerPerson |
+| **Encoding** | Sex → binary, Embarked → one-hot, Title & FamilySizeBin → one-hot |
+| **Models** | Voting Ensemble: LogisticRegression, RandomForest, GradientBoosting, SVC |
+| **Evaluation** | **10-fold Stratified Cross-Validation** (Stability Check) |
+| **Output** | `submission_vX.csv` — `[PassengerId, Survived]` |
 
 ## 📊 Features Used
 
@@ -88,14 +107,15 @@ This will:
 |---|---|---|
 | Pclass | Original | Ordinal |
 | Sex | Encoded (male=0, female=1) | Binary |
-| Age | Imputed → binned into AgeBand | Ordinal |
-| Fare | Imputed → binned into FareBand | Ordinal |
-| SibSp, Parch | Original | Numeric |
-| FamilySize | SibSp + Parch + 1 | Numeric |
-| IsAlone | 1 if FamilySize == 1 | Binary |
+| Age | Imputed by Title median | Numeric |
+| Fare_Log | log1p transform | Numeric |
+| IsAlone | Binary: 1 if FS=1 | Binary |
 | Title | Extracted from Name | Categorical |
-| Deck | First letter of Cabin | Categorical |
-| Embarked | One-hot encoded (S, C, Q) | Categorical |
+| FamilySizeBin | Solo, Small, Large | Categorical |
+| HasCabin | Binary: 1 if Cabin known | **Binary (Big Signal)** |
+| IsBoy | Master Title or Age < 12 | **Binary (Big Signal)** |
+| Age_Pclass | Interaction term | Numeric |
+| FarePerPerson | Total Fare / FamilySize | Numeric |
 
 ## 🛠️ Tech Stack
 
@@ -173,6 +193,15 @@ Revert to Generalizable Baseline Ensemble
                                                   └── Score: ↑ 0.77990
                                                         (Best score so far)
                                                         (Less overfit, better LB generalization)
+                                                        │
+                                                        ▼
+Add Surgical Features & Model Diversity
+(Add HasCabin, FarePerPerson, SVC to Ensemble)
+(Switch to 10-Fold Stratified CV for stability)
+                                                  │
+                                                  └── Score: TBD (Target 0.80+)
+                                                        (Improved class separation)
+                                                        (Reduced local vs LB variance)
                                                         │
                                                         ▼
                                                   CURRENT STATE

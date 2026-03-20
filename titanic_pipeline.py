@@ -19,6 +19,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, VotingClassifier
 
 warnings.filterwarnings("ignore")
@@ -88,7 +89,13 @@ class GeneralizationFeatureTransformer(BaseEstimator, TransformerMixin):
         family_size = df["SibSp"] + df["Parch"] + 1
         df["FamilySizeBin"] = pd.cut(family_size, bins=[0, 1, 4, 100], labels=["Alone", "Small", "Large"], right=True)
         
-        # 5. Core Macro-Interactions (IsBoy captures the only subset of males who reliably survived)
+        # 5. FarePerPerson — normalizes family ticket cost
+        df["FarePerPerson"] = df["Fare_Log"] / family_size
+        
+        # 6. HasCabin — wealth/status proxy (66.7% vs 30.0% survival)
+        df["HasCabin"] = df["Cabin"].notna().astype(int)
+        
+        # 7. Core Macro-Interactions
         df["IsBoy"] = ((df["Title"] == "Master") | ((df["Sex"] == "male") & (df["Age"] <= 12))).astype(int)
         df["Age_Pclass"] = df["Age"] * df["Pclass"]
         
@@ -100,7 +107,7 @@ class GeneralizationFeatureTransformer(BaseEstimator, TransformerMixin):
         return df
 
 def get_preprocessor():
-    numeric_features = ["Age", "Fare_Log", "Age_Pclass", "IsBoy"]
+    numeric_features = ["Age", "Fare_Log", "Age_Pclass", "IsBoy", "FarePerPerson", "HasCabin"]
     categorical_features = ["Pclass", "Sex", "Embarked", "Title", "FamilySizeBin"]
 
     # RobustScaler inherently manages severe Titanic outliers better than standard scaler
@@ -146,11 +153,15 @@ def main():
         n_estimators=100, max_depth=4, min_samples_leaf=3, random_state=RANDOM_STATE
     )
     
-    # We combine Linear + Boosted + Bagged approaches. 
-    # This triad physically prevents the ensemble from submitting high-confidence errors on Test data.
+    # 4. SVC (Margin-based geometry — genuinely different decision surface)
+    svc_model = SVC(
+        kernel='rbf', C=1.0, gamma='scale', probability=True, random_state=RANDOM_STATE
+    )
+    
+    # Linear + Boosted + Bagged + Margin = maximum algorithmic diversity
     voting_clf = VotingClassifier(
-        estimators=[('lr', lr_model), ('gb', gb_model), ('rf', rf_model)],
-        voting='soft', weights=[1, 2, 1] 
+        estimators=[('lr', lr_model), ('gb', gb_model), ('rf', rf_model), ('svc', svc_model)],
+        voting='soft', weights=[1, 2, 1, 1] 
     )
     
     full_model = Pipeline([
