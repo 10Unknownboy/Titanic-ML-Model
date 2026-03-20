@@ -181,8 +181,8 @@ cython_debug/
 .cursorindexingignore
 
 # Generated output
-submission.csv
-submission.zip
+submission*.csv
+submission*.zip
 feature_importances.png
 correlation_heatmap.png
 
