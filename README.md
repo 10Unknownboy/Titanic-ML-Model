@@ -163,10 +163,20 @@ Add Advanced Features
                                                   (Noise > signal)
                                                   │
                                                   ▼
-CURRENT STATE
-(OOF + XGBoost + moderate features)
+Revert to Generalizable Baseline Ensemble
+(Drop XGBoost + OOF; Switch to Soft VotingClassifier)
+(LogisticRegression weight=1 + GradientBoosting weight=2)
+(Core features only: Title, Age, Fare_Log, IsAlone,)
+(FamilySizeBin, Age_Pclass, Pclass, Sex, Embarked)
+(Strict 80/20 stratified holdout validation)
                                                   │
-                                                  └── Plateau: 0.75–0.76
+                                                  └── Score: ↑ 0.77990
+                                                        (Best score so far)
+                                                        (Less overfit, better LB generalization)
+                                                        │
+                                                        ▼
+                                                  CURRENT STATE
+                                                  Target: 0.80+
 ```
 
 ## 📝 License
