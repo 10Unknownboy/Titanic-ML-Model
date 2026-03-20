@@ -78,17 +78,17 @@ def engineer_features(train, test):
     combined["Sex"] = combined["Sex"].map({"male": 0, "female": 1})
 
     # ── Embarked ─────────────────────────────────────────────────────
-    combined["Embarked"].fillna(combined["Embarked"].mode()[0], inplace=True)
+    combined["Embarked"] = combined["Embarked"].fillna(combined["Embarked"].mode()[0])
 
     # ── Fare ─────────────────────────────────────────────────────────
-    combined["Fare"].fillna(combined["Fare"].median(), inplace=True)
+    combined["Fare"] = combined["Fare"].fillna(combined["Fare"].median())
     combined["Fare"] = np.log1p(combined["Fare"])          # log-transform skew
 
     # ── Age — predictive imputation using Title median ───────────────
     age_map = combined.groupby("Title")["Age"].median()
     for title, med in age_map.items():
         combined.loc[combined["Age"].isnull() & (combined["Title"] == title), "Age"] = med
-    combined["Age"].fillna(combined["Age"].median(), inplace=True)
+    combined["Age"] = combined["Age"].fillna(combined["Age"].median())
 
     # ── Family features ──────────────────────────────────────────────
     combined["FamilySize"] = combined["SibSp"] + combined["Parch"] + 1
@@ -120,14 +120,14 @@ def engineer_features(train, test):
         combined["Age"],
         bins=[0, 5, 12, 18, 25, 35, 50, 65, 120],
         labels=[0, 1, 2, 3, 4, 5, 6, 7],
-    ).astype(int)
+        include_lowest=True,
+    ).fillna(0).astype(int)
 
     # ── Fare bands ───────────────────────────────────────────────────
     combined["FareBand"] = pd.qcut(
         combined["Fare"], q=5,
         labels=[0, 1, 2, 3, 4], duplicates="drop",
-    )
-    combined["FareBand"] = combined["FareBand"].fillna(2).astype(int)  # median bucket
+    ).fillna(0).astype(int)
 
     # ── Interaction features ─────────────────────────────────────────
     combined["Age*Pclass"]  = combined["Age"] * combined["Pclass"]
@@ -153,8 +153,8 @@ def engineer_features(train, test):
 
     # Fill unknowns with global mean
     global_mean = y.mean()
-    combined["FamilySurvRate"].fillna(global_mean, inplace=True)
-    combined["TicketSurvRate"].fillna(global_mean, inplace=True)
+    combined["FamilySurvRate"] = combined["FamilySurvRate"].fillna(global_mean)
+    combined["TicketSurvRate"] = combined["TicketSurvRate"].fillna(global_mean)
 
     # ── Encode categoricals ──────────────────────────────────────────
     for col in ["Title", "Deck"]:
