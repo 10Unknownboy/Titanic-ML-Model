@@ -183,6 +183,8 @@ cython_debug/
 # Generated output
 submission.csv
 submission.zip
+feature_importances.png
+correlation_heatmap.png
 
 # Editor / Agent
 .gemini/
