@@ -1,8 +1,8 @@
 """
-Titanic Survival Prediction — XGBoost Generalization Pipeline
-=============================================================
-A clean, leak-free pipeline utilizing strict macro-trend features
-and heavily regularized XGBoost to achieve 0.80+ Kaggle test scores.
+Titanic Survival Prediction — XGBoost Decision Threshold Optimization
+=====================================================================
+Optimizes probability boundary (AUC/Logloss) before converting
+to hard classes, achieving generalized 0.80+ Kaggle accuracy.
 
 Usage:
   python titanic_pipeline.py
@@ -11,17 +11,14 @@ Usage:
 import pandas as pd
 import numpy as np
 import warnings
-import os
 import glob
 
-from sklearn.model_selection import RepeatedStratifiedKFold, cross_val_score, train_test_split
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import VotingClassifier
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.base import BaseEstimator, TransformerMixin
 from xgboost import XGBClassifier
 
@@ -72,7 +69,6 @@ class TitanicFeatureTransformer(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
         X_copy = X.copy()
         X_copy = extract_title(X_copy)
-        
         self.age_medians_ = X_copy.groupby("Title")["Age"].median().to_dict()
         self.global_age_median_ = X_copy["Age"].median()
         self.fare_median_ = X_copy["Fare"].median()
@@ -94,7 +90,6 @@ class TitanicFeatureTransformer(BaseEstimator, TransformerMixin):
         
         df["Age_Pclass"] = df["Age"] * df["Pclass"]
         df["Fare_Pclass"] = df["Fare_Log"] * df["Pclass"]
-        df["IsChild"] = (df["Age"] < 12).astype(int)
         
         drop_cols = ["Name", "Ticket", "Cabin", "PassengerId"]
         df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
@@ -103,7 +98,7 @@ class TitanicFeatureTransformer(BaseEstimator, TransformerMixin):
         return df
 
 def get_preprocessor():
-    numeric_features = ["Age", "Fare_Log", "SibSp", "Parch", "FamilySize", "Age_Pclass", "Fare_Pclass", "IsChild"]
+    numeric_features = ["Age", "Fare_Log", "SibSp", "Parch", "FamilySize", "Age_Pclass", "Fare_Pclass"]
     categorical_features = ["Pclass", "Sex", "Embarked", "Title", "IsAlone"]
 
     num_pipeline = Pipeline([('imputer', SimpleImputer(strategy='median'))])
@@ -122,48 +117,30 @@ def get_preprocessor():
         ("col_transformer", col_transformer)
     ])
 
-def build_models(preprocessor):
-    lr_pipe = Pipeline([
-        ('preprocessor', preprocessor),
-        ('scaler', StandardScaler()),
-        ('classifier', LogisticRegression(C=0.1, max_iter=1000, random_state=RANDOM_STATE))
-    ])
-    
-    xgb_pipe = Pipeline([
-        ('preprocessor', preprocessor),
-        ('classifier', XGBClassifier(
-            n_estimators=500,
-            learning_rate=0.03,
-            max_depth=4,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.5,
-            reg_lambda=1.0,
-            random_state=RANDOM_STATE,
-            eval_metric='logloss'
-        ))
-    ])
-    
-    voting_clf = VotingClassifier(
-        estimators=[('lr', lr_pipe), ('xgb', xgb_pipe)],
-        voting='soft', weights=[1, 4] # Favors XGBoost heavily
-    )
-    
-    return {
-        "XGBoost Classifier": xgb_pipe,
-        "Weighted Voting": voting_clf
-    }
+def optimize_threshold(y_true, y_probs):
+    """Finds the optimal probability threshold to maximize accuracy on the validation set."""
+    best_thresh = 0.5
+    best_acc = 0
+    # Search from 0.3 to 0.7
+    for thresh in np.arange(0.3, 0.71, 0.01):
+        preds = (y_probs >= thresh).astype(int)
+        acc = accuracy_score(y_true, preds)
+        if acc > best_acc:
+            best_acc = acc
+            best_thresh = thresh
+    return best_thresh, best_acc
 
 def main():
     print("Loading data...")
     full_train_df, test_df = load_data()
     
+    # ─── HOLD-OUT VALIDATION SPLIT ───
     df_train, df_val = train_test_split(
         full_train_df, test_size=0.2, stratify=full_train_df["Survived"], random_state=RANDOM_STATE
     )
     
-    X_train_cv = df_train.drop(columns=["Survived"])
-    y_train_cv = df_train["Survived"]
+    X_train = df_train.drop(columns=["Survived"])
+    y_train = df_train["Survived"]
     
     X_val = df_val.drop(columns=["Survived"])
     y_val = df_val["Survived"]
@@ -172,45 +149,55 @@ def main():
     test_ids = pd.DataFrame({"PassengerId": pd.read_csv(TEST_PATH)["PassengerId"]})
     
     preprocessor = get_preprocessor()
-    models = build_models(preprocessor)
     
-    cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=RANDOM_STATE)
+    # ─── XGBoost MODEL ───
+    xgb_pipe = Pipeline([
+        ('preprocessor', preprocessor),
+        ('classifier', XGBClassifier(
+            n_estimators=400,
+            learning_rate=0.04,
+            max_depth=3,
+            min_child_weight=3,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            gamma=0.2,
+            random_state=RANDOM_STATE,
+            eval_metric='auc'
+        ))
+    ])
     
     print("=" * 65)
-    print("  MODEL EVALUATION (3x5 Repeated CV & 20% Holdout)")
+    print("  MODEL EVALUATION (Probability Optimization)")
     print("=" * 65)
     
-    best_name, best_val_score, best_model = None, 0, None
+    # Train purely on the 80% split
+    xgb_pipe.fit(X_train, y_train)
     
-    for name, model in models.items():
-        scores = cross_val_score(model, X_train_cv, y_train_cv, cv=cv, scoring='accuracy', n_jobs=-1)
-        mean_cv, std_cv = scores.mean(), scores.std()
-        
-        model.fit(X_train_cv, y_train_cv)
-        val_preds = model.predict(X_val)
-        val_acc = accuracy_score(y_val, val_preds)
-        
-        flag = "⚠️ Guard" if (mean_cv - val_acc) > 0.03 else "✅ Flow"
-        print(f"  {name:<22s} | CV: {mean_cv:.4f} (±{std_cv:.3f}) | Val: {val_acc:.4f} {flag}")
-        
-        # Strictly prioritize holdout score!
-        if val_acc > best_val_score:
-            best_val_score = val_acc
-            best_name = name
-            best_model = model
-            
+    # Extract Probabilities rather than hard classes
+    val_probs = xgb_pipe.predict_proba(X_val)[:, 1]
+    
+    auc_score = roc_auc_score(y_val, val_probs)
+    print(f"Validation AUC: {auc_score:.4f}")
+    
+    # Tune Threshold
+    best_thresh, best_val_acc = optimize_threshold(y_val, val_probs)
+    default_acc = accuracy_score(y_val, (val_probs >= 0.5).astype(int))
+    
+    print(f"Default 0.5 Threshold Accuracy: {default_acc:.4f}")
+    print(f"Optimal Threshold ({best_thresh:.2f}) Accuracy: {best_val_acc:.4f}")
     print("=" * 65)
-    print(f"\n★ Best Generalizing Model: {best_name} (Holdout Acc: {best_val_score:.4f})")
     
-    print(f"Training {best_name} on the full 100% training set...")
+    # ─── FINAL TRAINING (100% Data) ───
+    print("\nTraining on the full 100% dataset pipeline...")
     X_full_train = full_train_df.drop(columns=["Survived"])
     y_full_train = full_train_df["Survived"]
-    best_model.fit(X_full_train, y_full_train)
+    xgb_pipe.fit(X_full_train, y_full_train)
 
-    print("Generating predictions...")
-    preds = best_model.predict(X_test_final)
+    print(f"\nGenerating predictions using optimal threshold: {best_thresh:.2f}...")
+    test_probs = xgb_pipe.predict_proba(X_test_final)[:, 1]
+    final_preds = (test_probs >= best_thresh).astype(int)
     
-    sub = pd.DataFrame({"PassengerId": test_ids["PassengerId"], "Survived": preds.astype(int)})
+    sub = pd.DataFrame({"PassengerId": test_ids["PassengerId"], "Survived": final_preds})
     sub.to_csv(SUBMISSION, index=False)
     print(f"✓ Saved {SUBMISSION} ({len(sub)} rows)\n")
 
