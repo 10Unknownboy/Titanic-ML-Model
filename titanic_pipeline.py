@@ -126,7 +126,8 @@ def engineer_features(train, test):
     combined["FareBand"] = pd.qcut(
         combined["Fare"], q=5,
         labels=[0, 1, 2, 3, 4], duplicates="drop",
-    ).astype(int)
+    )
+    combined["FareBand"] = combined["FareBand"].fillna(2).astype(int)  # median bucket
 
     # ── Interaction features ─────────────────────────────────────────
     combined["Age*Pclass"]  = combined["Age"] * combined["Pclass"]
