@@ -14,7 +14,7 @@ import warnings
 import glob
 
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
@@ -46,11 +46,10 @@ def load_data():
     return pd.read_csv(TRAIN_PATH), pd.read_csv(TEST_PATH)
 
 def optimize_threshold(y_true, y_probs):
-    """Finds the optimal probability threshold to maximize accuracy heavily based on OOF distribution."""
     best_thresh = 0.5
     best_acc = 0
-    # Search from 0.3 to 0.7
-    for thresh in np.arange(0.3, 0.71, 0.01):
+    # Search from 0.35 to 0.65 step 0.005
+    for thresh in np.arange(0.35, 0.655, 0.005):
         preds = (y_probs >= thresh).astype(int)
         acc = accuracy_score(y_true, preds)
         if acc > best_acc:
@@ -58,18 +57,12 @@ def optimize_threshold(y_true, y_probs):
             best_thresh = thresh
     return best_thresh, best_acc
 
-
 class TitanicFeatureTransformer(BaseEstimator, TransformerMixin):
-    """
-    Advanced Kaggle Transformer encapsulating leak-free structural mapping
-    and macro-pattern feature generation.
-    """
     def __init__(self):
         self.age_medians_ = {}
         self.global_age_median_ = None
+        self.fare_median_ = None
         self.ticket_counts_ = {}
-        self.ticket_surv_ = {}
-        self.global_surv_ = 0.38
         
     def extract_titles(self, df):
         df["Title"] = df["Name"].str.extract(r" ([A-Za-z]+)\.", expand=False)
@@ -90,17 +83,10 @@ class TitanicFeatureTransformer(BaseEstimator, TransformerMixin):
         
         self.age_medians_ = X_copy.groupby("Title")["Age"].median().to_dict()
         self.global_age_median_ = X_copy["Age"].median()
+        self.fare_median_ = X_copy["Fare"].median()
         
-        # Safe isolation: ONLY learn counts and survival from the training fold
+        # Learn counts exactly from the training fold
         self.ticket_counts_ = X_copy["Ticket"].value_counts().to_dict()
-        self.global_surv_ = y.mean() if y is not None else 0.38
-        
-        if y is not None:
-            X_copy["Survived"] = y
-            ticket_stats = X_copy.groupby("Ticket")["Survived"].agg(["mean", "count"])
-            # Only record survival bias for groups size > 1
-            self.ticket_surv_ = ticket_stats[ticket_stats["count"] > 1]["mean"].to_dict()
-            
         return self
 
     def transform(self, X):
@@ -113,27 +99,29 @@ class TitanicFeatureTransformer(BaseEstimator, TransformerMixin):
         df["Age"] = df["Age"].fillna(self.global_age_median_)
         
         # 2. Fare Engineering
-        df["Fare"] = df["Fare"].fillna(32.2) # fallback
+        df["Fare"] = df["Fare"].fillna(self.fare_median_)
         df["Fare_Log"] = np.log1p(df["Fare"])
         
         # 3. Family Architecture
-        df["FamilySize"] = df["SibSp"] + df["Parch"] + 1
-        df["IsAlone"] = (df["FamilySize"] == 1).astype(int)
-        df["FarePerPerson"] = df["Fare"] / df["FamilySize"]
+        family_size = df["SibSp"] + df["Parch"] + 1
+        df["FarePerPerson"] = df["Fare"] / family_size
+        
+        # FamilySize BIN
+        df["FamilySizeBin"] = pd.cut(family_size, bins=[0, 1, 4, 100], labels=["Alone", "Small", "Large"], right=True)
         
         # 4. Deep Structural Interactions
         df["Age_Pclass"] = df["Age"] * df["Pclass"]
-        
-        # High value features requested
         df["IsFemaleChild"] = ((df["Sex"] == "female") | (df["Age"] < 12)).astype(int)
         df["Pclass_Sex"] = df["Pclass"].astype(str) + "_" + df["Sex"]
         
-        # 5. Survival Rate Mappings (No Leakage when routed through KFold Pipeline)
-        df["TicketGroupSize"] = df["Ticket"].map(self.ticket_counts_).fillna(1)
-        df["FamilySurvival"] = df["Ticket"].map(self.ticket_surv_).fillna(self.global_surv_)
+        # 5. Cabin Deck
+        df["Deck"] = df["Cabin"].apply(lambda s: s[0] if pd.notnull(s) else "U")
         
-        # Purge raw cardinalities explicitly
-        drop_cols = ["Name", "Ticket", "Cabin", "PassengerId", "Fare"]
+        # 6. TicketGroupSize (frequency of the ticket map from training)
+        df["TicketGroupSize"] = df["Ticket"].map(self.ticket_counts_).fillna(1)
+        
+        # Purge explicitly dropped cardinalities
+        drop_cols = ["Name", "Ticket", "Cabin", "PassengerId", "Fare", "SibSp", "Parch"]
         df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
         
         df["Pclass"] = df["Pclass"].astype(str)
@@ -141,13 +129,16 @@ class TitanicFeatureTransformer(BaseEstimator, TransformerMixin):
 
 def get_preprocessor():
     numeric_features = [
-        "Age", "Fare_Log", "SibSp", "Parch", "FamilySize", 
-        "FarePerPerson", "Age_Pclass", "IsFemaleChild", 
-        "TicketGroupSize", "FamilySurvival"
+        "Age", "Fare_Log", "FarePerPerson", "Age_Pclass", "IsFemaleChild", "TicketGroupSize"
     ]
-    categorical_features = ["Pclass", "Sex", "Embarked", "Title", "IsAlone", "Pclass_Sex"]
+    categorical_features = ["Pclass", "Sex", "Embarked", "Title", "FamilySizeBin", "Pclass_Sex", "Deck"]
 
-    num_pipeline = Pipeline([('imputer', SimpleImputer(strategy='median'))])
+    # StandardScaler added to numeric features
+    num_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    
     cat_pipeline = Pipeline([
         ('imputer', SimpleImputer(strategy='most_frequent')),
         ('ohe', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
@@ -175,13 +166,15 @@ def main():
     xgb_pipe = Pipeline([
         ('preprocessor', get_preprocessor()),
         ('classifier', XGBClassifier(
-            n_estimators=450,
-            learning_rate=0.035,
+            n_estimators=600,
+            learning_rate=0.03,
             max_depth=3,
-            min_child_weight=3,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            gamma=0.2,
+            min_child_weight=2,
+            gamma=0.1,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_alpha=0.1,
+            reg_lambda=1.5,
             random_state=RANDOM_STATE,
             eval_metric='auc'
         ))
@@ -191,7 +184,7 @@ def main():
     print("  OOF EVALUATION & PROBABILITY TUNING (5-Fold Stratified)")
     print("=" * 65)
     
-    # Generate Out-Of-Fold probabilities (Completely Leak-Free natively via Sklearn Pipeline mechanics)
+    # Generate Out-Of-Fold probabilities (Leak-Free)
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     oof_probs = cross_val_predict(xgb_pipe, X, y, cv=cv, method='predict_proba', n_jobs=-1)[:, 1]
     
@@ -199,19 +192,19 @@ def main():
     oof_auc = roc_auc_score(y, oof_probs)
     print(f"OOF Validation AUC: {oof_auc:.4f}")
     
-    # Sweep optimal threshold strictly against the OOF probabilities
+    # Sweep optimal threshold strictly against OOF distribution
     best_thresh, best_oof_acc = optimize_threshold(y, oof_probs)
     default_acc = accuracy_score(y, (oof_probs >= 0.5).astype(int))
     
     print(f"Default 0.5 Threshold Accuracy: {default_acc:.4f}")
-    print(f"Optimal Threshold ({best_thresh:.2f}) Accuracy: {best_oof_acc:.4f}")
+    print(f"Optimal Threshold ({best_thresh:.3f}) Accuracy: {best_oof_acc:.4f}")
     print("=" * 65)
     
     # ─── FINAL TRAINING ───
     print("\nTraining primary XGBoost model on full 100% dataset...")
     xgb_pipe.fit(X, y)
 
-    print(f"\nGenerating predictions projecting via optimal threshold: {best_thresh:.2f}...")
+    print(f"\nGenerating predictions projecting via optimal threshold: {best_thresh:.3f}...")
     test_probs = xgb_pipe.predict_proba(test_df)[:, 1]
     final_preds = (test_probs >= best_thresh).astype(int)
     
