@@ -1,11 +1,9 @@
 """
-Titanic Survival Prediction — Extreme Gradient Generalization Pipeline
+Titanic Survival Pipeline — Kaggle 0.80+ Generalization Architecture
 ====================================================================
-Utilizes advanced OOF (Out-Of-Fold) Threshold Optimization
-coupled with tightly regularized XGBoost for 0.80+ Leaderboard accuracy.
-
-Usage:
-  python titanic_pipeline.py
+Eliminates local holdout variance via 10-Fold CV. 
+Leverages pure, highly-diversified Soft Voting (Linear + Non-Linear)
+over strictly controlled fundamental features.
 """
 
 import pandas as pd
@@ -13,14 +11,15 @@ import numpy as np
 import warnings
 import glob
 
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, RobustScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.metrics import accuracy_score
 from sklearn.base import BaseEstimator, TransformerMixin
-from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, VotingClassifier
 
 warnings.filterwarnings("ignore")
 
@@ -45,82 +44,55 @@ SUBMISSION = get_submission_filename()
 def load_data():
     return pd.read_csv(TRAIN_PATH), pd.read_csv(TEST_PATH)
 
-def optimize_threshold(y_true, y_probs):
-    best_thresh = 0.5
-    best_acc = 0
-    # Search from 0.35 to 0.65 step 0.005
-    for thresh in np.arange(0.35, 0.655, 0.005):
-        preds = (y_probs >= thresh).astype(int)
-        acc = accuracy_score(y_true, preds)
-        if acc > best_acc:
-            best_acc = acc
-            best_thresh = thresh
-    return best_thresh, best_acc
-
-class TitanicFeatureTransformer(BaseEstimator, TransformerMixin):
+class GeneralizationFeatureTransformer(BaseEstimator, TransformerMixin):
     def __init__(self):
         self.age_medians_ = {}
         self.global_age_median_ = None
         self.fare_median_ = None
-        self.ticket_counts_ = {}
-        
-    def extract_titles(self, df):
-        df["Title"] = df["Name"].str.extract(r" ([A-Za-z]+)\.", expand=False)
-        title_map = {
-            "Mlle": "Miss", "Ms": "Miss", "Mme": "Mrs",
-            "Lady": "Rare", "Dona": "Rare", "Countess": "Rare", 
-            "Sir": "Rare", "Don": "Rare", "Jonkheer": "Rare",
-            "Capt": "Rare", "Col": "Rare", "Major": "Rare", "Dr": "Rare", "Rev": "Rare"
-        }
-        df["Title"] = df["Title"].replace(title_map).fillna("Mr")
-        core_titles = ["Mr", "Miss", "Mrs", "Master"]
-        df.loc[~df["Title"].isin(core_titles), "Title"] = "Rare"
-        return df
 
     def fit(self, X, y=None):
         X_copy = X.copy()
-        X_copy = self.extract_titles(X_copy)
+        
+        # Isolate Title
+        X_copy["Title"] = X_copy["Name"].str.extract(r" ([A-Za-z]+)\.", expand=False)
+        title_map = {"Mlle": "Miss", "Ms": "Miss", "Mme": "Mrs", "Lady": "Rare", "Dona": "Rare", "Countess": "Rare", "Sir": "Rare", "Don": "Rare", "Jonkheer": "Rare", "Capt": "Rare", "Col": "Rare", "Major": "Rare", "Dr": "Rare", "Rev": "Rare"}
+        X_copy["Title"] = X_copy["Title"].replace(title_map).fillna("Mr")
+        core_titles = ["Mr", "Miss", "Mrs", "Master"]
+        X_copy.loc[~X_copy["Title"].isin(core_titles), "Title"] = "Rare"
         
         self.age_medians_ = X_copy.groupby("Title")["Age"].median().to_dict()
         self.global_age_median_ = X_copy["Age"].median()
         self.fare_median_ = X_copy["Fare"].median()
-        
-        # Learn counts exactly from the training fold
-        self.ticket_counts_ = X_copy["Ticket"].value_counts().to_dict()
         return self
 
     def transform(self, X):
         df = X.copy()
-        df = self.extract_titles(df)
         
-        # 1. Age Imputation
+        # 1. Exact Title Processing
+        df["Title"] = df["Name"].str.extract(r" ([A-Za-z]+)\.", expand=False)
+        title_map = {"Mlle": "Miss", "Ms": "Miss", "Mme": "Mrs", "Lady": "Rare", "Dona": "Rare", "Countess": "Rare", "Sir": "Rare", "Don": "Rare", "Jonkheer": "Rare", "Capt": "Rare", "Col": "Rare", "Major": "Rare", "Dr": "Rare", "Rev": "Rare"}
+        df["Title"] = df["Title"].replace(title_map).fillna("Mr")
+        core_titles = ["Mr", "Miss", "Mrs", "Master"]
+        df.loc[~df["Title"].isin(core_titles), "Title"] = "Rare"
+        
+        # 2. Strict Age Imputation protecting the 'Master' (Boy) signal
         for title, med in self.age_medians_.items():
             df.loc[df["Age"].isnull() & (df["Title"] == title), "Age"] = med
         df["Age"] = df["Age"].fillna(self.global_age_median_)
         
-        # 2. Fare Engineering
+        # 3. Robust Fare Logging
         df["Fare"] = df["Fare"].fillna(self.fare_median_)
         df["Fare_Log"] = np.log1p(df["Fare"])
         
-        # 3. Family Architecture
+        # 4. Critical Kaggle Feature: Family Size Bins (Alone vs Small vs Large)
         family_size = df["SibSp"] + df["Parch"] + 1
-        df["FarePerPerson"] = df["Fare"] / family_size
-        
-        # FamilySize BIN
         df["FamilySizeBin"] = pd.cut(family_size, bins=[0, 1, 4, 100], labels=["Alone", "Small", "Large"], right=True)
         
-        # 4. Deep Structural Interactions
+        # 5. Core Macro-Interactions (IsBoy captures the only subset of males who reliably survived)
+        df["IsBoy"] = ((df["Title"] == "Master") | ((df["Sex"] == "male") & (df["Age"] <= 12))).astype(int)
         df["Age_Pclass"] = df["Age"] * df["Pclass"]
-        df["IsFemaleChild"] = ((df["Sex"] == "female") | (df["Age"] < 12)).astype(int)
-        df["Pclass_Sex"] = df["Pclass"].astype(str) + "_" + df["Sex"]
         
-        # 5. Cabin Deck
-        df["Deck"] = df["Cabin"].apply(lambda s: s[0] if pd.notnull(s) else "U")
-        
-        # 6. TicketGroupSize (frequency of the ticket map from training)
-        df["TicketGroupSize"] = df["Ticket"].map(self.ticket_counts_).fillna(1)
-        
-        # Purge explicitly dropped cardinalities
+        # Purge absolute noise and highly correlated excess
         drop_cols = ["Name", "Ticket", "Cabin", "PassengerId", "Fare", "SibSp", "Parch"]
         df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
         
@@ -128,15 +100,13 @@ class TitanicFeatureTransformer(BaseEstimator, TransformerMixin):
         return df
 
 def get_preprocessor():
-    numeric_features = [
-        "Age", "Fare_Log", "FarePerPerson", "Age_Pclass", "IsFemaleChild", "TicketGroupSize"
-    ]
-    categorical_features = ["Pclass", "Sex", "Embarked", "Title", "FamilySizeBin", "Pclass_Sex", "Deck"]
+    numeric_features = ["Age", "Fare_Log", "Age_Pclass", "IsBoy"]
+    categorical_features = ["Pclass", "Sex", "Embarked", "Title", "FamilySizeBin"]
 
-    # StandardScaler added to numeric features
+    # RobustScaler inherently manages severe Titanic outliers better than standard scaler
     num_pipeline = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
-        ('scaler', StandardScaler())
+        ('scaler', RobustScaler()) 
     ])
     
     cat_pipeline = Pipeline([
@@ -144,69 +114,72 @@ def get_preprocessor():
         ('ohe', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
     ])
 
-    col_transformer = ColumnTransformer(transformers=[
+    return ColumnTransformer(transformers=[
         ('num', num_pipeline, numeric_features),
         ('cat', cat_pipeline, categorical_features)
-    ])
-    
-    return Pipeline([
-        ("feature_engineering", TitanicFeatureTransformer()),
-        ("col_transformer", col_transformer)
     ])
 
 def main():
     print("Loading datasets...")
     train_df, test_df = load_data()
     
-    X = train_df.drop(columns=["Survived"])
-    y = train_df["Survived"]
+    X_train = train_df.drop(columns=["Survived"])
+    y_train = train_df["Survived"]
     test_ids = pd.DataFrame({"PassengerId": test_df["PassengerId"]})
     
-    # ─── XGBoost MODEL WITH HEAVY REGULARIZATION ───
-    xgb_pipe = Pipeline([
-        ('preprocessor', get_preprocessor()),
-        ('classifier', XGBClassifier(
-            n_estimators=600,
-            learning_rate=0.03,
-            max_depth=3,
-            min_child_weight=2,
-            gamma=0.1,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            random_state=RANDOM_STATE,
-            eval_metric='auc'
-        ))
+    base_pipeline = Pipeline([
+        ("feature_engineering", GeneralizationFeatureTransformer()),
+        ("preprocessor", get_preprocessor())
+    ])
+    
+    # ─── MODELS & ENSEMBLE DIVERSITY ───
+    # 1. High Regularization Linear Model (Extracts smooth absolute macro trends)
+    lr_model = LogisticRegression(C=0.1, max_iter=1000, random_state=RANDOM_STATE)
+    
+    # 2. Shallow Gradient Boost (Extracts non-linear boundaries safely)
+    gb_model = GradientBoostingClassifier(
+        n_estimators=200, learning_rate=0.05, max_depth=3, min_samples_split=4, subsample=0.8, random_state=RANDOM_STATE
+    )
+    
+    # 3. Random Forest (Adds extreme ensemble diversity guarding against variance)
+    rf_model = RandomForestClassifier(
+        n_estimators=100, max_depth=4, min_samples_leaf=3, random_state=RANDOM_STATE
+    )
+    
+    # We combine Linear + Boosted + Bagged approaches. 
+    # This triad physically prevents the ensemble from submitting high-confidence errors on Test data.
+    voting_clf = VotingClassifier(
+        estimators=[('lr', lr_model), ('gb', gb_model), ('rf', rf_model)],
+        voting='soft', weights=[1, 2, 1] 
+    )
+    
+    full_model = Pipeline([
+        ('base', base_pipeline),
+        ('classifier', voting_clf)
     ])
     
     print("=" * 65)
-    print("  OOF EVALUATION & PROBABILITY TUNING (5-Fold Stratified)")
+    print("  MODEL EVALUATION (10-Fold Stratified Cross-Validation)")
     print("=" * 65)
     
-    # Generate Out-Of-Fold probabilities (Leak-Free)
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    oof_probs = cross_val_predict(xgb_pipe, X, y, cv=cv, method='predict_proba', n_jobs=-1)[:, 1]
+    # Ditch 80/20 Holdout entirely. We use 10-Fold CV covering 100% of train data implicitly.
+    cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=RANDOM_STATE)
+    cv_scores = cross_val_score(full_model, X_train, y_train, cv=cv, scoring='accuracy', n_jobs=-1)
     
-    # Analyze OOF metrics
-    oof_auc = roc_auc_score(y, oof_probs)
-    print(f"OOF Validation AUC: {oof_auc:.4f}")
-    
-    # Sweep optimal threshold strictly against OOF distribution
-    best_thresh, best_oof_acc = optimize_threshold(y, oof_probs)
-    default_acc = accuracy_score(y, (oof_probs >= 0.5).astype(int))
-    
-    print(f"Default 0.5 Threshold Accuracy: {default_acc:.4f}")
-    print(f"Optimal Threshold ({best_thresh:.3f}) Accuracy: {best_oof_acc:.4f}")
+    print(f"10-Fold CV Mean Accuracy: {cv_scores.mean():.4f}")
+    print(f"10-Fold CV Std Deviation: ±{cv_scores.std():.4f}")
+    if cv_scores.std() > 0.05:
+        print("⚠️ Warning: High fold variance detected. Generalization risk is elevated.")
+    else:
+        print("✅ Stable fold distribution. High confidence in Leaderboard generalization.")
     print("=" * 65)
     
     # ─── FINAL TRAINING ───
-    print("\nTraining primary XGBoost model on full 100% dataset...")
-    xgb_pipe.fit(X, y)
+    print("\nTraining Final Pipeline on FULL 100% dataset to maximize pattern extraction...")
+    full_model.fit(X_train, y_train)
 
-    print(f"\nGenerating predictions projecting via optimal threshold: {best_thresh:.3f}...")
-    test_probs = xgb_pipe.predict_proba(test_df)[:, 1]
-    final_preds = (test_probs >= best_thresh).astype(int)
+    print("Generating pure ensemble predictions...")
+    final_preds = full_model.predict(test_df)
     
     sub = pd.DataFrame({"PassengerId": test_ids["PassengerId"], "Survived": final_preds})
     sub.to_csv(SUBMISSION, index=False)

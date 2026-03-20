@@ -104,6 +104,71 @@ This will:
 - **NumPy** — numerical computing
 - **scikit-learn** — ML models & evaluation
 
+## 📈 Model Evolution & Score Tracking
+
+```text
+START
+  │
+  ▼
+Baseline Pipeline (Basic features + models)
+  │
+  └── Score: ~0.76
+        │
+        ▼
+Add Heavy Feature Engineering
+(AgeBand, FareBand, interactions, many features)
+        │
+        └── Score: ↓ 0.75
+              (Overfitting + noise introduced)
+              │
+              ▼
+Add More Complex Features
+(Ticket, Surname, Deck, multiple interactions)
+              │
+              └── Score: ↓ 0.753 → ↓ 0.748
+                    (High cardinality noise)
+                    │
+                    ▼
+Switch to Simpler Features + Clean Pipeline
+(Removed noise, reduced features)
+                    │
+                    └── Score: ↑ 0.758
+                          (Better generalization)
+                          │
+                          ▼
+Introduce XGBoost Model
+(Regularized boosting, no CV tuning yet)
+                          │
+                          └── Score: ↓ 0.748
+                                (Underfitting / poor tuning)
+                                │
+                                ▼
+Add Threshold Optimization (Single split)
+                                │
+                                └── Score: ↑ 0.753
+                                      (Better decision boundary)
+                                      │
+                                      ▼
+Switch to OOF Cross-Validation + Threshold
+(Proper validation strategy)
+                                      │
+                                      └── Score: ~0.751
+                                            (Stable but plateau)
+                                            │
+                                            ▼
+Add Advanced Features
+(FamilySurvival, Ticket survival mapping)
+                                            │
+                                            └── Score: ~0.751
+                                                  (Noise > signal)
+                                                  │
+                                                  ▼
+CURRENT STATE
+(OOF + XGBoost + moderate features)
+                                                  │
+                                                  └── Plateau: 0.75–0.76
+```
+
 ## 📝 License
 
 This project is licensed under the terms in [LICENSE](LICENSE).
