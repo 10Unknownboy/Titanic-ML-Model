@@ -1,14 +1,14 @@
 """
-Titanic Survival Prediction — Optimized Robust Pipeline
-======================================================
-Refactored to eliminate data leakage, simplify the ensemble, 
-and improve out-of-sample generalization (aiming for ~82-84% on Kaggle).
+Titanic Survival Prediction — Generalization Optimized Pipeline
+==============================================================
+Refactored to eliminate cross-validation bias, reduce overfitting,
+and align local CV scores with the actual Kaggle leaderboard.
 
 Key Fixes:
-  • Dropped leaky family/ticket survival rate features.
-  • Stricter Train/Test separation (imputations fit on train only via Pipelines).
-  • Simplified stacking to reduce overfitting.
-  • Added graphical representations (Feature Importances & Correlation Matrix).
+  • Replaced StratifiedKFold with RepeatedStratifiedKFold.
+  • Added a 20% hold-out validation set to simulate the Kaggle test set.
+  • Heavily regularized tree models (GBM, RF) to prevent overfitting.
+  • Stripped noisy features (HasCabin) that suffer from distribution shift.
 
 Usage (Colab):
   !pip install pandas numpy scikit-learn matplotlib seaborn
@@ -21,7 +21,7 @@ import warnings
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import RepeatedStratifiedKFold, cross_val_score, train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -29,6 +29,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score
 
 warnings.filterwarnings("ignore")
 
@@ -45,39 +46,36 @@ def load_data():
 
 def extract_title(df):
     df["Title"] = df["Name"].str.extract(r" ([A-Za-z]+)\.", expand=False)
+    # Simplify titles aggressively to avoid overfitting to rare test-set occurrences
     title_map = {
         "Mlle": "Miss", "Ms": "Miss", "Mme": "Mrs",
-        "Lady": "Mrs", "Dona": "Mrs", "Countess": "Mrs", 
-        "Sir": "Mr", "Don": "Mr", "Jonkheer": "Mr",
-        "Capt": "Officer", "Col": "Officer", "Major": "Officer",
-        "Dr": "Officer", "Rev": "Officer"
+        "Lady": "Miss", "Dona": "Miss", "Countess": "Mrs",  # Female rare -> regular
+        "Sir": "Mr", "Don": "Mr", "Jonkheer": "Mr",         # Male rare -> regular
+        "Capt": "Mr", "Col": "Mr", "Major": "Mr", "Dr": "Mr", "Rev": "Mr" # Male officer -> Mr
     }
+    # Notice we map almost all rare titles back to standard ones to drastically reduce overfitting
     df["Title"] = df["Title"].replace(title_map)
-    # Re-map unmapped rare titles to "Rare"
-    common_titles = ["Mr", "Miss", "Mrs", "Master", "Officer"]
-    df.loc[~df["Title"].isin(common_titles), "Title"] = "Rare"
+    df["Title"] = df["Title"].fillna("Mr")
     return df
 
 
 def feature_engineering(df):
     """
-    Apply row-wise feature engineering that doesn't depend on population statistics.
-    This prevents data leakage between train and test.
+    Apply row-wise feature engineering.
+    Kept minimal and robust to prevent distribution shift generalization errors.
     """
     df = df.copy()
     df = extract_title(df)
     
-    # Family Features
+    # Family Features - keep simple
     df["FamilySize"] = df["SibSp"] + df["Parch"] + 1
     df["IsAlone"] = (df["FamilySize"] == 1).astype(int)
     
     # Fare - Log Transform to handle skewness
     df["Fare"] = np.log1p(df["Fare"])
     
-    # Deck
-    df["HasCabin"] = df["Cabin"].notna().astype(int)
-    
     # Drop columns that are noisy, leak-prone, or processed
+    # Dropped 'Cabin' entirely as its missingness distribution shifts heavily in test
     drop_cols = ["Name", "Ticket", "Cabin", "PassengerId"]
     df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
     
@@ -85,15 +83,12 @@ def feature_engineering(df):
 
 
 def impute_age(train, test):
-    """ 
-    Impute Age using median per Title, trained STRICTLY on the train set.
-    """
+    """ Impute Age using median per Title, trained strictly on the train set """
     title_age_median = train.groupby("Title")["Age"].median()
     
     for df in [train, test]:
         for title, med in title_age_median.items():
             df.loc[df["Age"].isnull() & (df["Title"] == title), "Age"] = med
-        # Fallback for any remaining NaNs
         df["Age"] = df["Age"].fillna(title_age_median.median())
         
     return train, test
@@ -102,21 +97,17 @@ def impute_age(train, test):
 def get_preprocessor():
     """ 
     Creates a scikit-learn ColumnTransformer. 
-    Keeps numerical and categorical processing robust and completely prevents data leakage.
     """
+    # Removed highly volatile features
     numeric_features = ["Age", "Fare", "SibSp", "Parch", "FamilySize"]
-    categorical_features = ["Pclass", "Sex", "Embarked", "Title", "IsAlone", "HasCabin"]
+    categorical_features = ["Pclass", "Sex", "Embarked", "Title", "IsAlone"]
 
-    # Numerical pipeline: Impute missing (if any) then pass through 
-    # (Scaling is handled specifically for models that need it inside their own pipelines)
     num_pipeline = Pipeline([
         ('imputer', SimpleImputer(strategy='median'))
     ])
 
-    # Categorical pipeline: Impute missing with mode, then OneHotEncode
     cat_pipeline = Pipeline([
         ('imputer', SimpleImputer(strategy='most_frequent')),
-        # handle_unknown='ignore' safely handles test categories not seen in train
         ('ohe', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
     ])
 
@@ -131,9 +122,7 @@ def get_preprocessor():
 
 def build_models(preprocessor):
     """
-    Build models wrapped in pipelines.
-    Models that require scaling (LR, SVC) get a StandardScaler in their pipeline.
-    Tree models (RF, GB) do not.
+    Build extensively regularized models to prevent 84% CV -> 76% Kaggle drops.
     """
     lr_pipe = Pipeline([
         ('preprocessor', preprocessor),
@@ -144,20 +133,22 @@ def build_models(preprocessor):
     svc_pipe = Pipeline([
         ('preprocessor', preprocessor),
         ('scaler', StandardScaler()),
-        ('classifier', SVC(C=1.0, gamma='scale', probability=True, random_state=RANDOM_STATE))
+        # Stronger regularization (C=0.5 instead of 1.0)
+        ('classifier', SVC(C=0.5, gamma='scale', probability=True, random_state=RANDOM_STATE))
     ])
 
     rf_pipe = Pipeline([
         ('preprocessor', preprocessor),
-        ('classifier', RandomForestClassifier(n_estimators=150, max_depth=5, min_samples_leaf=2, random_state=RANDOM_STATE))
+        # Regularized RF: shallower depth, more samples per leaf
+        ('classifier', RandomForestClassifier(n_estimators=200, max_depth=4, min_samples_leaf=4, random_state=RANDOM_STATE))
     ])
     
     gb_pipe = Pipeline([
         ('preprocessor', preprocessor),
-        ('classifier', GradientBoostingClassifier(n_estimators=100, max_depth=3, learning_rate=0.05, random_state=RANDOM_STATE))
+        # Regularized GB: tiny learning rate, subsample to prevent overfitting noise
+        ('classifier', GradientBoostingClassifier(n_estimators=150, max_depth=3, learning_rate=0.02, min_samples_leaf=5, subsample=0.7, random_state=RANDOM_STATE))
     ])
     
-    # Simplified Voting Ensemble (Soft Voting)
     voting_clf = VotingClassifier(
         estimators=[
             ('lr', lr_pipe),
@@ -180,18 +171,14 @@ def build_models(preprocessor):
 def generate_plots(model, X_train, y_train):
     """ Generates graphical representations for the data and model """
     print("\n[+] Generating graphical representations...")
-    
     try:
-        # Extract the preprocessor and a tree classifier to get feature importances
         if hasattr(model, 'named_estimators_'):
-            # It's the Voting Ensemble, grab Gradient Boosting
             preprocessor = model.named_estimators_['gb'].named_steps['preprocessor']
             clf = model.named_estimators_['gb'].named_steps['classifier']
         else:
             preprocessor = model.named_steps['preprocessor']
             clf = model.named_steps['classifier']
             
-        # Get feature names after OneHotEncoding
         cat_enc = preprocessor.named_transformers_['cat'].named_steps['ohe']
         cat_features = preprocessor.transformers_[1][2]
         num_features = preprocessor.transformers_[0][2]
@@ -199,12 +186,11 @@ def generate_plots(model, X_train, y_train):
         ohe_features = list(cat_enc.get_feature_names_out(cat_features))
         feature_names = num_features + ohe_features
         
-        # 1. Feature Importance (Only valid if tree based)
         if hasattr(clf, 'feature_importances_'):
             importances = clf.feature_importances_
             indices = np.argsort(importances)[::-1]
             
-            plt.figure(figsize=(12, 6))
+            plt.figure(figsize=(10, 6))
             plt.title(f"Feature Importances ({type(clf).__name__})")
             plt.bar(range(len(importances)), importances[indices], align="center", color='#2ca02c')
             plt.xticks(range(len(importances)), [feature_names[i] for i in indices], rotation=45, ha='right')
@@ -212,12 +198,11 @@ def generate_plots(model, X_train, y_train):
             plt.savefig("feature_importances.png")
             print("  -> Saved 'feature_importances.png'")
         
-        # 2. Correlation Heatmap
         X_transformed = preprocessor.transform(X_train)
         df_transformed = pd.DataFrame(X_transformed, columns=feature_names)
         df_transformed['Survived'] = y_train.values
         
-        plt.figure(figsize=(14, 10))
+        plt.figure(figsize=(12, 8))
         sns.heatmap(df_transformed.corr(), annot=False, cmap='coolwarm', fmt=".2f", linewidths=0.5)
         plt.title("Feature Correlation Heatmap")
         plt.tight_layout()
@@ -230,68 +215,84 @@ def generate_plots(model, X_train, y_train):
 
 def main():
     print("Loading data...")
-    train_df, test_df = load_data()
-    y = train_df["Survived"]
+    full_train_df, test_df = load_data()
     
     print("Engineering features...")
-    train_df = feature_engineering(train_df)
+    full_train_df = feature_engineering(full_train_df)
     test_df = feature_engineering(test_df)
     
     print("Imputing age without leakage...")
-    train_df, test_df = impute_age(train_df, test_df)
+    full_train_df, test_df = impute_age(full_train_df, test_df)
     
-    # Drop Survived from training features
-    X_train = train_df.drop(columns=["Survived"])
-    X_test = test_df
+    # ─── HOLD-OUT VALIDATION SPLIT (Simulate Kaggle test set) ────────────
+    df_train, df_val = train_test_split(
+        full_train_df, test_size=0.2, stratify=full_train_df["Survived"], random_state=RANDOM_STATE
+    )
     
-    # Fetch PassengerIds for submission
+    X_train_cv = df_train.drop(columns=["Survived"])
+    y_train_cv = df_train["Survived"]
+    
+    X_val = df_val.drop(columns=["Survived"])
+    y_val = df_val["Survived"]
+    
+    X_test_final = test_df
     test_ids = pd.read_csv(TEST_PATH)["PassengerId"]
     
-    # Setup robust Pipeline
     preprocessor = get_preprocessor()
     models = build_models(preprocessor)
     
-    # 5-Fold Stratified Cross Validation
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    # Use RepeatedStratifiedKFold for much more stable CV accuracy estimates
+    cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=RANDOM_STATE)
     
-    print("=" * 60)
-    print("  MODEL EVALUATION (5-Fold Stratified CV - Leak-Free)")
-    print("=" * 60)
+    print("=" * 75)
+    print("  MODEL EVALUATION (3x5 Repeated Stratified CV & 20% Holdout)")
+    print("=" * 75)
     
     best_name = None
-    best_score = 0
+    best_val_score = 0
     best_model = None
     
     for name, model in models.items():
-        # Because we use sklearn Pipelines, data scaling and encoding are correctly
-        # fitted purely on the training folds and applied to validation folds.
-        scores = cross_val_score(model, X_train, y, cv=cv, scoring='accuracy', n_jobs=-1)
-        mean_acc = scores.mean()
-        std_acc = scores.std()
-        print(f"  {name:<25s} {mean_acc:.4f} ± {std_acc:.4f}")
+        # 1. Cross Validation on the 80% training set
+        scores = cross_val_score(model, X_train_cv, y_train_cv, cv=cv, scoring='accuracy', n_jobs=-1)
+        mean_cv = scores.mean()
+        std_cv = scores.std()
         
-        if mean_acc > best_score:
-            best_score = mean_acc
+        # 2. Train on 80% and evaluate on 20% holdout
+        model.fit(X_train_cv, y_train_cv)
+        val_preds = model.predict(X_val)
+        val_acc = accuracy_score(y_val, val_preds)
+        
+        # Flag models where mean_cv overestimates val_acc noticeably
+        overfit_flag = "⚠️ Guard" if (mean_cv - val_acc) > 0.03 else "✅ Flow"
+        
+        print(f"  {name:<20s} | CV: {mean_cv:.4f} (±{std_cv:.3f}) | Val: {val_acc:.4f} {overfit_flag}")
+        
+        # Select BEST based on HOLDOUT VALIDATION, simulating actual unseen Kaggle test
+        if val_acc > best_val_score:
+            best_val_score = val_acc
             best_name = name
             best_model = model
             
-    print("=" * 60)
-    print(f"\n★ Best Model Evaluated: {best_name} ({best_score:.4f})")
+    print("=" * 75)
+    print(f"\n★ Best Generalizing Model: {best_name} (Holdout Acc: {best_val_score:.4f})")
     
-    # Train best model on full training set
-    print(f"\nTraining {best_name} on full training set...")
-    best_model.fit(X_train, y)
+    # ─── FINAL TRAINING ──────────────────────────────────────────────────
+    print(f"\nTraining {best_name} on the full 100% training set...")
+    X_full_train = full_train_df.drop(columns=["Survived"])
+    y_full_train = full_train_df["Survived"]
+    best_model.fit(X_full_train, y_full_train)
     
     # Generate graphical plots
-    generate_plots(best_model, X_train, y)
+    generate_plots(best_model, X_full_train, y_full_train)
 
-    # Generate test predictions
     print("\nGenerating predictions...")
-    preds = best_model.predict(X_test)
+    preds = best_model.predict(X_test_final)
     
     sub = pd.DataFrame({"PassengerId": test_ids, "Survived": preds.astype(int)})
     sub.to_csv(SUBMISSION, index=False)
     print(f"✓ Saved {SUBMISSION} ({len(sub)} rows)\n")
+
 
 if __name__ == "__main__":
     main()
