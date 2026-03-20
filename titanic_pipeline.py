@@ -1,7 +1,11 @@
 """
-Titanic Survival Prediction — Kaggle Robust Generalization Pipeline
-===================================================================
-A clean, minimal, leak-free pipeline targeting max out-of-sample Kaggle score (0.80+).
+Titanic Survival Prediction — XGBoost Generalization Pipeline
+=============================================================
+A clean, leak-free pipeline utilizing strict macro-trend features
+and heavily regularized XGBoost to achieve 0.80+ Kaggle test scores.
+
+Usage:
+  python titanic_pipeline.py
 """
 
 import pandas as pd
@@ -16,9 +20,10 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+from sklearn.ensemble import VotingClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.base import BaseEstimator, TransformerMixin
+from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore")
 
@@ -88,6 +93,8 @@ class TitanicFeatureTransformer(BaseEstimator, TransformerMixin):
         df["IsAlone"] = (df["FamilySize"] == 1).astype(int)
         
         df["Age_Pclass"] = df["Age"] * df["Pclass"]
+        df["Fare_Pclass"] = df["Fare_Log"] * df["Pclass"]
+        df["IsChild"] = (df["Age"] < 12).astype(int)
         
         drop_cols = ["Name", "Ticket", "Cabin", "PassengerId"]
         df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
@@ -96,7 +103,7 @@ class TitanicFeatureTransformer(BaseEstimator, TransformerMixin):
         return df
 
 def get_preprocessor():
-    numeric_features = ["Age", "Fare_Log", "SibSp", "Parch", "FamilySize", "Age_Pclass"]
+    numeric_features = ["Age", "Fare_Log", "SibSp", "Parch", "FamilySize", "Age_Pclass", "Fare_Pclass", "IsChild"]
     categorical_features = ["Pclass", "Sex", "Embarked", "Title", "IsAlone"]
 
     num_pipeline = Pipeline([('imputer', SimpleImputer(strategy='median'))])
@@ -122,25 +129,28 @@ def build_models(preprocessor):
         ('classifier', LogisticRegression(C=0.1, max_iter=1000, random_state=RANDOM_STATE))
     ])
     
-    rf_pipe = Pipeline([
+    xgb_pipe = Pipeline([
         ('preprocessor', preprocessor),
-        ('classifier', RandomForestClassifier(n_estimators=100, max_depth=5, min_samples_leaf=4, random_state=RANDOM_STATE))
-    ])
-    
-    gb_pipe = Pipeline([
-        ('preprocessor', preprocessor),
-        ('classifier', GradientBoostingClassifier(n_estimators=250, max_depth=3, learning_rate=0.04, min_samples_leaf=5, subsample=0.8, random_state=RANDOM_STATE))
+        ('classifier', XGBClassifier(
+            n_estimators=500,
+            learning_rate=0.03,
+            max_depth=4,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.5,
+            reg_lambda=1.0,
+            random_state=RANDOM_STATE,
+            eval_metric='logloss'
+        ))
     ])
     
     voting_clf = VotingClassifier(
-        estimators=[('lr', lr_pipe), ('rf', rf_pipe), ('gb', gb_pipe)],
-        voting='soft', weights=[1, 1, 3] # Favors GradientBoosting strictly
+        estimators=[('lr', lr_pipe), ('xgb', xgb_pipe)],
+        voting='soft', weights=[1, 4] # Favors XGBoost heavily
     )
     
     return {
-        "Logistic Regression": lr_pipe,
-        "Random Forest": rf_pipe,
-        "Gradient Boosting": gb_pipe,
+        "XGBoost Classifier": xgb_pipe,
         "Weighted Voting": voting_clf
     }
 
