@@ -52,19 +52,13 @@ features:
   numeric:
     - "Age"
     - "Fare_Log"
-    - "FarePerPerson"
     - "FamilySize"
-    - "TicketFrequency"
-    - "GroupSurvival"
 
   categorical:
     - "Pclass"
     - "Sex"
     - "Embarked"
     - "Title"
-    - "Deck"
-    - "IsBoy"
-    - "IsMarriedWoman"
 
 # --- Training ---
 training:
@@ -132,5 +126,5 @@ models:
 
 # --- Ensemble ---
 ensemble:
-  method: "stacking"
-  voting_weights: [0, 2, 2, 2, 2, 2, 0]  # Only use tree models if voting
+  method: "voting"
+  voting_weights: [0, 2, 1, 0, 0, 0, 0]  # Only use Random Forest and Gradient Boosting
